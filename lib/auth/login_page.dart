@@ -188,25 +188,27 @@ class _LoginPageState extends State<LoginPage> {
                 ),
 
                 const SizedBox(height: 16),
-
-                // Code
                 TextFormField(
                   controller: _codeController,
                   decoration: const InputDecoration(
                     labelText: 'Code',
                     border: OutlineInputBorder(),
-                    prefixIcon: Icon(Icons.vpn_key),
+                    prefixIcon: Icon(Icons.vpn_key), // Fixed: removed asterisk
                   ),
-                  keyboardType: TextInputType.number,
+                  keyboardType:
+                      TextInputType.text, // Allows both words and digits
                   enabled: !_isLoading,
                   validator: (value) {
                     if (value == null || value.isEmpty) {
                       return 'Please enter the code';
                     }
+                    // Optional: Add minimum length validation
+                    if (value.length < 4) {
+                      return 'Code must be at least 4 characters';
+                    }
                     return null;
                   },
                 ),
-
                 const SizedBox(height: 30),
 
                 // Login Button

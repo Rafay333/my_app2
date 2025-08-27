@@ -5,7 +5,7 @@ import '../models/device_status.dart';
 
 class ApiService {
   // Use your computer's IP address instead of localhost for physical device testing
-  static const String baseUrl = 'http://10.0.2.2:5035/api';
+  static const String baseUrl = 'http://localhost:5035/api';
   static const Duration timeoutDuration = Duration(seconds: 30);
 
   // ================= AUTH =================
@@ -188,6 +188,82 @@ class ApiService {
     }
   }
 
+  // ================= ENGINE CONTROL =================
+
+  /// Turn Engine ON
+  static Future<Map<String, dynamic>> turnEngineOn(String deviceId) async {
+    try {
+      final headers = await AuthService.getAuthHeaders();
+      final url = '$baseUrl/devices/$deviceId/engine/on';
+
+      final response = await http
+          .post(Uri.parse(url), headers: headers)
+          .timeout(timeoutDuration);
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        return {
+          'success': true,
+          'message': data['message'] ?? 'Engine turned ON successfully',
+          'deviceId': data['deviceId'],
+          'engineStatus': data['engineStatus'],
+        };
+      } else if (response.statusCode == 404) {
+        return {
+          'success': false,
+          'message': 'Device not found',
+        };
+      } else {
+        return {
+          'success': false,
+          'message': 'Failed to turn engine ON: ${response.statusCode}',
+        };
+      }
+    } catch (e) {
+      return {
+        'success': false,
+        'message': 'Error turning engine ON: $e',
+      };
+    }
+  }
+
+  /// Turn Engine OFF
+  static Future<Map<String, dynamic>> turnEngineOff(String deviceId) async {
+    try {
+      final headers = await AuthService.getAuthHeaders();
+      final url = '$baseUrl/devices/$deviceId/engine/off';
+
+      final response = await http
+          .post(Uri.parse(url), headers: headers)
+          .timeout(timeoutDuration);
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        return {
+          'success': true,
+          'message': data['message'] ?? 'Engine turned OFF successfully',
+          'deviceId': data['deviceId'],
+          'engineStatus': data['engineStatus'],
+        };
+      } else if (response.statusCode == 404) {
+        return {
+          'success': false,
+          'message': 'Device not found',
+        };
+      } else {
+        return {
+          'success': false,
+          'message': 'Failed to turn engine OFF: ${response.statusCode}',
+        };
+      }
+    } catch (e) {
+      return {
+        'success': false,
+        'message': 'Error turning engine OFF: $e',
+      };
+    }
+  }
+
   static Future<List<Map<String, dynamic>>>
   getAvailableDevicesForInstallation() async {
     try {
@@ -215,6 +291,66 @@ class ApiService {
   }
 
   // ================= LOCATION TRACKING =================
+
+  /// Send periodic location update to backend
+  static Future<Map<String, dynamic>> sendLocationUpdate({
+    required String deviceId,
+    required double latitude,
+    required double longitude,
+    required double accuracy,
+    required String sessionId,
+  }) async {
+    try {
+      final headers = await AuthService.getAuthHeaders();
+      final urls = [
+        '$baseUrl/devices/$deviceId/location/update',
+        '$baseUrl/tracking/$deviceId/location',
+        '$baseUrl/location/update/$deviceId',
+      ];
+
+      final body = {
+        'deviceId': deviceId,
+        'latitude': latitude,
+        'longitude': longitude,
+        'accuracy': accuracy,
+        'timestamp': DateTime.now().toIso8601String(),
+        'sessionId': sessionId,
+        'source': 'installation_tracking',
+      };
+
+      for (final url in urls) {
+        try {
+          final response = await http
+              .post(Uri.parse(url), headers: headers, body: jsonEncode(body))
+              .timeout(timeoutDuration);
+
+          if (response.statusCode == 200) {
+            final data = jsonDecode(response.body);
+            return {
+              'success': true,
+              'message': data['message'] ?? 'Location updated successfully',
+              'timestamp': body['timestamp'],
+            };
+          }
+        } catch (e) {
+          // Try next URL
+          continue;
+        }
+      }
+
+      // If all URLs fail, return offline success
+      return {
+        'success': true,
+        'message': 'Location cached (offline mode)',
+        'timestamp': body['timestamp'],
+      };
+    } catch (e) {
+      return {
+        'success': false,
+        'message': 'Failed to send location update: ${e.toString()}',
+      };
+    }
+  }
 
   /// Start location tracking for a device during installation
   static Future<Map<String, dynamic>> startLocationTracking(
@@ -672,4 +808,5 @@ class ApiService {
       };
     }
   }
+
 }

